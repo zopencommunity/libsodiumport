@@ -1,0 +1,198 @@
+# bump: libsodium-version /LIBSODIUM_VERSION="(.*)"/ https://github.com/jedisct1/libsodium.git|semver:*
+LIBSODIUM_VERSION="1.0.20"
+
+###
+### Build control file for the libsodium port
+###
+### libsodium is a C crypto library. It is wanted here mainly because PyNaCl
+### needs it, and PyNaCl in turn is what blocks paramiko (SSH) and pygithub.
+### PyNaCl vendors its own copy, but building that copy in-place gives every
+### consumer its own libsodium; a port lets PyNaCl link a single shared one
+### with SODIUM_INSTALL=system.
+###
+### One patch is required -- see patches/README.md. It is in the random number
+### generator, so read that file before relying on this port.
+###
+
+export ZOPEN_PROJECT_NAME="libsodium"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_CATEGORIES="library security"
+
+# GIT rather than the release tarball: applyPatches needs a git-managed source
+# tree and skips patching entirely without one, which here would silently
+# produce a library whose RNG does not compile.
+export ZOPEN_STABLE_URL="https://github.com/jedisct1/libsodium.git"
+export ZOPEN_STABLE_TAG="${LIBSODIUM_VERSION}-RELEASE"
+export ZOPEN_DEV_URL="https://github.com/jedisct1/libsodium.git"
+
+# make must be GNU make. z/OS make rejects -j and cannot handle the pattern
+# rules in libsodium's generated Makefiles, failing with
+# "FSUM9435 Empty recipe for special target %".
+export ZOPEN_STABLE_DEPS="make coreutils diffutils findutils sed grep bash zoslib"
+export ZOPEN_DEV_DEPS="make coreutils diffutils findutils sed grep bash zoslib"
+export ZOPEN_RUNTIME_DEPS="zoslib"
+
+zopen_get_version() {
+  echo "${LIBSODIUM_VERSION}"
+}
+
+zopen_pre_configure() {
+  # Force /bin/sh as the shell recorded in the generated Makefiles.
+  #
+  # The zopen bash changes directory to /jenkins when it starts, so any make
+  # recipe that runs through it begins in the wrong place. libsodium recurses
+  # into subdirectories, so the first recursion fails with
+  #
+  #   bash: line 21: cd: builds: EDC5129I No such file or directory.
+  #
+  # which reads as a missing source directory rather than a shell that moved.
+  # configure bakes SHELL into every Makefile, so setting it here fixes the
+  # whole tree at once.
+  export SHELL="/bin/sh"
+  export CONFIG_SHELL="/bin/sh"
+
+  # posix_memalign sits behind __SUSV3_RT in <stdlib.h>, which _UNIX03_SOURCE
+  # turns on. Without it configure still detects the function -- its link test
+  # succeeds because the symbol exists in libc -- and then argon2-core.c fails
+  # with "call to undeclared function 'posix_memalign'". So the build breaks
+  # only after configure has recorded HAVE_POSIX_MEMALIGN 1, which points at
+  # the source rather than at a missing feature-test macro.
+  export CPPFLAGS="-D_UNIX03_SOURCE ${CPPFLAGS}"
+  export CFLAGS="-D_UNIX03_SOURCE ${CFLAGS}"
+}
+
+# Upstream's "make check" cannot be used here, and the reason is worth stating
+# so nobody "fixes" it later. Its tests hash and encode C string literals, then
+# compare against .exp files generated from ASCII inputs. On z/OS a literal is
+# EBCDIC, so the inputs genuinely differ and the outputs differ with them --
+# sha256 of EBCDIC "abc" is b58ea6d3..., not ba7816bf.... The harness compares
+# byte-for-byte and exits 99 with no output, which looks like a crash. Running
+# it here reports 5 failures and 31 errors against a library that is computing
+# everything correctly.
+#
+# So check known answers with inputs written as explicit bytes, where EBCDIC
+# cannot intrude, plus a concurrency test for the RNG patch.
+export ZOPEN_CHECK="zopen_custom_check"
+
+zopen_custom_check() {
+  cat > kat.c <<'KATEOF'
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include "sodium.h"
+
+#define THREADS 8
+#define DRAWS   500
+#define BLOCK   16
+static unsigned char results[THREADS][DRAWS][BLOCK];
+
+static void *worker(void *arg) {
+    long id = (long) arg; int i;
+    for (i = 0; i < DRAWS; i++) randombytes_buf(results[id][i], BLOCK);
+    return NULL;
+}
+static int cmp(const void *a, const void *b) { return memcmp(a, b, BLOCK); }
+
+static int fails = 0;
+static void check(const char *label, int ok) {
+    printf(ok ? "PASS: %s\n" : "FAIL: %s\n", label);
+    if (!ok) fails++;
+}
+static int hexeq(const unsigned char *b, size_t n, const char *want) {
+    char got[256]; size_t i;
+    for (i = 0; i < n; i++) sprintf(got + i * 2, "%02x", b[i]);
+    return strcmp(got, want) == 0;
+}
+
+int main(void) {
+    check("sodium_init", sodium_init() == 0);
+
+    /* SHA-256 of the bytes 0x61 0x62 0x63 -- "abc" written explicitly, because
+     * the literal "abc" is EBCDIC on this platform. */
+    const unsigned char abc[3] = { 0x61, 0x62, 0x63 };
+    unsigned char h[crypto_hash_sha256_BYTES];
+    crypto_hash_sha256(h, abc, sizeof abc);
+    check("sha256 known answer",
+          hexeq(h, sizeof h,
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+
+    /* RFC 7539 ChaCha20, all-zero key and nonce. */
+    unsigned char key[32], nonce[8], out[32];
+    memset(key, 0, sizeof key); memset(nonce, 0, sizeof nonce);
+    crypto_stream_chacha20(out, sizeof out, nonce, key);
+    check("chacha20 known answer",
+          hexeq(out, sizeof out,
+                "76b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7"));
+
+    /* Ed25519 round trip. */
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES], sk[crypto_sign_SECRETKEYBYTES];
+    unsigned char sig[crypto_sign_BYTES];
+    unsigned long long siglen;
+    const unsigned char msg[4] = { 0xde, 0xad, 0xbe, 0xef };
+    crypto_sign_keypair(pk, sk);
+    crypto_sign_detached(sig, &siglen, msg, sizeof msg, sk);
+    check("ed25519 sign/verify",
+          crypto_sign_verify_detached(sig, msg, sizeof msg, pk) == 0);
+    sig[0] ^= 0x01;
+    check("ed25519 rejects a tampered signature",
+          crypto_sign_verify_detached(sig, msg, sizeof msg, pk) != 0);
+
+    /* secretbox round trip. */
+    unsigned char sbk[crypto_secretbox_KEYBYTES], sbn[crypto_secretbox_NONCEBYTES];
+    unsigned char ct[crypto_secretbox_MACBYTES + 4], pt[4];
+    crypto_secretbox_keygen(sbk); randombytes_buf(sbn, sizeof sbn);
+    crypto_secretbox_easy(ct, msg, sizeof msg, sbn, sbk);
+    check("secretbox round trip",
+          crypto_secretbox_open_easy(pt, ct, sizeof ct, sbn, sbk) == 0 &&
+          memcmp(pt, msg, sizeof msg) == 0);
+
+    /* The RNG state is thread-local through a pthread key on this platform
+     * (see patches/). Concurrent draws must not share or race it. */
+    pthread_t t[THREADS]; long i, j; int round;
+    for (round = 0; round < 2; round++) {
+        for (i = 0; i < THREADS; i++) pthread_create(&t[i], NULL, worker, (void *) i);
+        for (i = 0; i < THREADS; i++) pthread_join(t[i], NULL);
+    }
+    long total = (long) THREADS * DRAWS, zeros = 0, dups = 0;
+    unsigned char zero[BLOCK]; memset(zero, 0, BLOCK);
+    static unsigned char flat[THREADS * DRAWS][BLOCK];
+    long n = 0;
+    for (i = 0; i < THREADS; i++)
+        for (j = 0; j < DRAWS; j++) {
+            if (memcmp(results[i][j], zero, BLOCK) == 0) zeros++;
+            memcpy(flat[n++], results[i][j], BLOCK);
+        }
+    qsort(flat, (size_t) total, BLOCK, cmp);
+    for (j = 1; j < total; j++)
+        if (memcmp(flat[j - 1], flat[j], BLOCK) == 0) dups++;
+    check("rng produces output on every thread", zeros == 0);
+    check("rng streams do not collide across threads", dups == 0);
+
+    printf("libsodium KAT -- %d failed\n", fails);
+    return fails == 0 ? 0 : 1;
+}
+KATEOF
+  # _OPEN_THREADS is required for pthread_t to be declared at all on z/OS.
+  "${CC:-clang}" -D_OPEN_THREADS=3 \
+    -I"${ZOPEN_ROOT}/${sourcedir}/src/libsodium/include" \
+    -I"${ZOPEN_ROOT}/${sourcedir}/src/libsodium/include/sodium" \
+    -o kat kat.c "${ZOPEN_ROOT}/${sourcedir}/src/libsodium/.libs/libsodium.a" || return 1
+  ./kat
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 and also exits 1, so a fallback appends a
+  # second zero and the arithmetic dies with FSUM9224 "bad number".
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+  echo "actualFailures:${failed}"
+  echo "totalTests:$((passed + failed))"
+  echo "expectedFailures:0"
+}
+
+zopen_append_to_validate_install() {
+  echo "test -f \${PWD}/lib/libsodium.a"
+}

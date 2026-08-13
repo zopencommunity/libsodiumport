@@ -1,0 +1,117 @@
+diff --git a/src/libsodium/randombytes/internal/randombytes_internal_random.c b/src/libsodium/randombytes/internal/randombytes_internal_random.c
+index d39063c..cc5c4d7 100644
+--- a/src/libsodium/randombytes/internal/randombytes_internal_random.c
++++ b/src/libsodium/randombytes/internal/randombytes_internal_random.c
+@@ -97,15 +97,29 @@ BOOLEAN NTAPI RtlGenRandom(PVOID RandomBuffer, ULONG RandomBufferLength);
+ # endif
+ #endif
+ 
+-#if !defined(TLS) && !defined(__STDC_NO_THREADS__) && \
+-    defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+-# define TLS _Thread_local
++#if defined(__MVS__)
++/* z/OS: the compiler supports neither _Thread_local nor __thread, so the
++ * cascade below would fall through to the empty TLS fallback. That fallback
++ * makes "stream" -- the per-thread ChaCha20 RNG state -- a single shared
++ * object, and concurrent randombytes_* calls then race on the key, the nonce
++ * and the output buffer. That is a correctness bug in a random number
++ * generator, not a performance one, so use POSIX thread-specific data, which
++ * z/OS does support. See the stream_get() shim further down. */
++# define SODIUM_TLS_PTHREAD 1
++# include <pthread.h>
+ #endif
+-#ifndef TLS
+-# ifdef _WIN32
+-#  define TLS __declspec(thread)
+-# else
+-#  define TLS
++
++#if !defined(SODIUM_TLS_PTHREAD)
++# if !defined(TLS) && !defined(__STDC_NO_THREADS__) && \
++     defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
++#  define TLS _Thread_local
++# endif
++# ifndef TLS
++#  ifdef _WIN32
++#   define TLS __declspec(thread)
++#  else
++#   define TLS
++#  endif
+ # endif
+ #endif
+ 
+@@ -133,11 +147,74 @@ static InternalRandomGlobal global = {
+     SODIUM_C99(.random_data_source_fd =) -1
+ };
+ 
++#ifdef SODIUM_TLS_PTHREAD
++
++/* One InternalRandom per thread, reached through a pthread key. Every existing
++ * "stream.field", "&stream" and "sizeof stream" in this file keeps working
++ * unchanged because of the macro at the end of this block. calloc() gives the
++ * zero-initialised state the original static initialiser provided. */
++static pthread_key_t  stream_tls_key;
++static pthread_once_t stream_tls_once = PTHREAD_ONCE_INIT;
++
++static void
++stream_tls_free(void *p)
++{
++    if (p != NULL) {
++        sodium_memzero(p, sizeof(InternalRandom));
++        free(p);
++    }
++}
++
++static void
++stream_tls_init(void)
++{
++    if (pthread_key_create(&stream_tls_key, stream_tls_free) != 0) {
++        sodium_misuse();
++    }
++}
++
++static InternalRandom *
++stream_get(void)
++{
++    InternalRandom *p;
++
++    if (pthread_once(&stream_tls_once, stream_tls_init) != 0) {
++        sodium_misuse();
++    }
++    /* z/OS declares the legacy form
++     *     int pthread_getspecific(pthread_key_t, void **)
++     * rather than POSIX's
++     *     void *pthread_getspecific(pthread_key_t)
++     * unless feature-test macros select otherwise, and <pthread.h> here
++     * offers both. Use the two-argument form, which is what this
++     * compilation actually sees; getting it wrong fails with "too few
++     * arguments to function call" rather than anything about threads. */
++    p = NULL;
++    (void) pthread_getspecific(stream_tls_key, (void **) &p);
++    if (p == NULL) {
++        if ((p = (InternalRandom *) calloc((size_t) 1U,
++                                           sizeof(InternalRandom))) == NULL) {
++            sodium_misuse();
++        }
++        if (pthread_setspecific(stream_tls_key, p) != 0) {
++            free(p);
++            sodium_misuse();
++        }
++    }
++    return p;
++}
++
++# define stream (*stream_get())
++
++#else
++
+ static TLS InternalRandom stream = {
+     SODIUM_C99(.initialized =) 0,
+     SODIUM_C99(.rnd32_outleft =) (size_t) 0U
+ };
+ 
++#endif
++
+ 
+ /*
+  * Get a high-resolution timestamp, as a uint64_t value
