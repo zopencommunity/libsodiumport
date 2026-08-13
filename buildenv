@@ -48,6 +48,20 @@ zopen_get_version() {
   echo "${LIBSODIUM_VERSION}"
 }
 
+# posix_memalign sits behind __SUSV3_RT in <stdlib.h>, which _UNIX03_SOURCE
+# turns on. Without it configure still detects the function -- its link test
+# passes because the symbol is in libc -- and argon2-core.c then fails with
+# "call to undeclared function 'posix_memalign'", pointing at the source rather
+# than at a missing feature-test macro.
+#
+# These are ZOPEN_EXTRA_* rather than exports in a hook. zopen-build composes
+#   export CFLAGS="${ZOPEN_CFLAGS} ${ZOPEN_EXTRA_CFLAGS}"
+# during dependency setup, so anything a hook exports into CFLAGS directly is
+# overwritten before configure runs -- which is exactly what happened on the
+# first CI build, where --disable-asm took effect and the macro did not.
+export ZOPEN_EXTRA_CPPFLAGS="-D_UNIX03_SOURCE"
+export ZOPEN_EXTRA_CFLAGS="-D_UNIX03_SOURCE"
+
 zopen_pre_configure() {
   # Force /bin/sh as the shell recorded in the generated Makefiles.
   #
@@ -62,15 +76,6 @@ zopen_pre_configure() {
   # whole tree at once.
   export SHELL="/bin/sh"
   export CONFIG_SHELL="/bin/sh"
-
-  # posix_memalign sits behind __SUSV3_RT in <stdlib.h>, which _UNIX03_SOURCE
-  # turns on. Without it configure still detects the function -- its link test
-  # succeeds because the symbol exists in libc -- and then argon2-core.c fails
-  # with "call to undeclared function 'posix_memalign'". So the build breaks
-  # only after configure has recorded HAVE_POSIX_MEMALIGN 1, which points at
-  # the source rather than at a missing feature-test macro.
-  export CPPFLAGS="-D_UNIX03_SOURCE ${CPPFLAGS}"
-  export CFLAGS="-D_UNIX03_SOURCE ${CFLAGS}"
 }
 
 # Upstream's "make check" cannot be used here, and the reason is worth stating
