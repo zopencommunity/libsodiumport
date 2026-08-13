@@ -32,6 +32,18 @@ export ZOPEN_STABLE_DEPS="make coreutils diffutils findutils sed grep bash zosli
 export ZOPEN_DEV_DEPS="make coreutils diffutils findutils sed grep bash zoslib"
 export ZOPEN_RUNTIME_DEPS="zoslib"
 
+# --disable-asm turns off libsodium's hand-written assembly and CPU-feature
+# libraries. On z/OS that is not an optimisation choice, it is required:
+# configure decides AES-NI is available because the *compiler* accepts the
+# intrinsics, without regard to whether the *target* has the instructions --
+# and AES-NI is x86. The build then fails in libtool with
+#
+#   cannot build libtool library 'libaesni.la' from non-libtool objects
+#
+# which points at libtool rather than at an x86 acceleration library being
+# built for a mainframe.
+export ZOPEN_EXTRA_CONFIGURE_OPTS="--disable-asm"
+
 zopen_get_version() {
   echo "${LIBSODIUM_VERSION}"
 }
