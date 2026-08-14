@@ -1,5 +1,5 @@
 # bump: libsodium-version /LIBSODIUM_VERSION="(.*)"/ https://github.com/jedisct1/libsodium.git|semver:*
-LIBSODIUM_VERSION="1.0.20"
+LIBSODIUM_VERSION="1.0.22"
 
 ###
 ### Build control file for the libsodium port
