@@ -40,7 +40,7 @@ index d39063c..cc5c4d7 100644
  # endif
  #endif
  
-@@ -133,11 +147,74 @@ static InternalRandomGlobal global = {
+@@ -133,11 +147,87 @@ static InternalRandomGlobal global = {
      SODIUM_C99(.random_data_source_fd =) -1
  };
  
@@ -78,16 +78,29 @@ index d39063c..cc5c4d7 100644
 +    if (pthread_once(&stream_tls_once, stream_tls_init) != 0) {
 +        sodium_misuse();
 +    }
-+    /* z/OS declares the legacy form
-+     *     int pthread_getspecific(pthread_key_t, void **)
-+     * rather than POSIX's
++    /* <pthread.h> on z/OS declares pthread_getspecific twice and selects
++     * between them with feature-test macros: POSIX's
 +     *     void *pthread_getspecific(pthread_key_t)
-+     * unless feature-test macros select otherwise, and <pthread.h> here
-+     * offers both. Use the two-argument form, which is what this
-+     * compilation actually sees; getting it wrong fails with "too few
-+     * arguments to function call" rather than anything about threads. */
++     * and a legacy
++     *     int pthread_getspecific(pthread_key_t, void **)
++     *
++     * Which one a translation unit sees therefore depends on how it was
++     * compiled, and guessing wrong is a hard error either way -- "too few
++     * arguments to function call" against the legacy form, "too many"
++     * against POSIX. Neither message mentions threads or portability, and
++     * a build that compiles standalone can still fail under the port's
++     * flags, which is exactly what happened here.
++     *
++     * The header branches on _OPEN_THREADS -- the POSIX declaration sits in
++     * the branch taken when it is absent, the legacy one behind
++     * "#elif defined(_OPEN_THREADS)" -- so branch on the same thing the
++     * header does rather than assuming either shape. */
++#if !defined(_OPEN_THREADS)
++    p = (InternalRandom *) pthread_getspecific(stream_tls_key);
++#else
 +    p = NULL;
 +    (void) pthread_getspecific(stream_tls_key, (void **) &p);
++#endif
 +    if (p == NULL) {
 +        if ((p = (InternalRandom *) calloc((size_t) 1U,
 +                                           sizeof(InternalRandom))) == NULL) {

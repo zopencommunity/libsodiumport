@@ -42,7 +42,51 @@ export ZOPEN_RUNTIME_DEPS="zoslib"
 #
 # which points at libtool rather than at an x86 acceleration library being
 # built for a mainframe.
-export ZOPEN_EXTRA_CONFIGURE_OPTS="--disable-asm"
+# ac_cv_func_posix_memalign=no is not a claim that the function is missing --
+# it is in libc, and configure's link test finds it. The compile of
+# argon2-core.c nonetheless fails with "call to undeclared function
+# 'posix_memalign'" even though -D_UNIX03_SOURCE is present in both CPPFLAGS
+# and CFLAGS on the real command line, and the same call compiles cleanly in
+# isolation under every combination of this build's flags, include order and
+# -isystem paths that could be reproduced. What hides the declaration inside
+# the full build is unresolved.
+#
+# Rather than guess, take the branch upstream ships for platforms without it.
+# The allocation chain in argon2-core.c is
+#
+#   #if defined(MAP_ANON) && defined(HAVE_MMAP)   <- MAP_ANON is not defined here
+#   #elif defined(HAVE_POSIX_MEMALIGN)            <- the branch that fails
+#   #else                                          <- portable malloc + 64-byte align
+#
+# so telling configure the function is unavailable lands on libsodium's own
+# portable path, with their alignment arithmetic rather than anything invented
+# here. The cost is a plain malloc per argon2 region instead of an aligned
+# allocation. crypto_pwhash is checked below because this is the code path the
+# setting moves.
+#
+# --disable-shared: z/OS libtool cannot build a shared library from these
+# objects and stops with
+#
+#   cannot build libtool library 'libaesni.la' from non-libtool objects on this host
+#
+# which names AES-NI and so reads as an x86 problem -- it is not, it is about
+# the shared build. Consumers here link the static archive anyway: zopen ships
+# .a files, and cryptography's extension already links its dependencies
+# statically.
+#
+# lt_cv_deplibs_check_method=pass_all: zopen-build puts two raw object files
+# into LIBS -- zoslib's celquopt.s.o and the generated zoslib_env_hook.o -- and
+# libtool refuses to build any .la library when LIBS holds non-libtool objects:
+#
+#   cannot build libtool library 'libaesni.la' from non-libtool objects on this host
+#
+# It names libaesni only because that is the first .la target reached, which
+# makes it read as an x86 problem; it is not, and it would fail on whichever
+# convenience library came first. Setting the cache variable makes libtool
+# accept them, which is the same effect as the configure patch zopen ports
+# usually carry for this, without pinning a patch to line numbers in a
+# generated file.
+export ZOPEN_EXTRA_CONFIGURE_OPTS="--disable-shared --disable-asm ac_cv_func_posix_memalign=no lt_cv_deplibs_check_method=pass_all lt_cv_sys_max_cmd_len=32768"
 
 zopen_get_version() {
   echo "${LIBSODIUM_VERSION}"
@@ -185,15 +229,57 @@ int main(void) {
     check("rng produces output on every thread", zeros == 0);
     check("rng streams do not collide across threads", dups == 0);
 
+    /* crypto_pwhash is argon2, whose allocator this port moves off
+     * posix_memalign onto libsodium's portable fallback, so exercise it. */
+    unsigned char pwkey[32], pwkey2[32];
+    unsigned char salt[crypto_pwhash_SALTBYTES];
+    const char pw[4] = { 0x70, 0x77, 0x64, 0x00 };  /* "pwd"; literals are EBCDIC here */
+    memset(salt, 0x42, sizeof salt);
+    check("argon2 derives a key",
+          crypto_pwhash(pwkey, sizeof pwkey, pw, 3, salt,
+                        crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                        crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                        crypto_pwhash_ALG_DEFAULT) == 0);
+    check("argon2 is deterministic for the same inputs",
+          crypto_pwhash(pwkey2, sizeof pwkey2, pw, 3, salt,
+                        crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                        crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                        crypto_pwhash_ALG_DEFAULT) == 0
+          && memcmp(pwkey, pwkey2, sizeof pwkey) == 0);
+    salt[0] ^= 0xFF;
+    check("argon2 output changes with the salt",
+          crypto_pwhash(pwkey2, sizeof pwkey2, pw, 3, salt,
+                        crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                        crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                        crypto_pwhash_ALG_DEFAULT) == 0
+          && memcmp(pwkey, pwkey2, sizeof pwkey) != 0);
+
     printf("libsodium KAT -- %d failed\n", fails);
     return fails == 0 ? 0 : 1;
 }
 KATEOF
+  # libsodium.a alone does not link here: the objects were compiled against
+  # zoslib, so __open_ascii and __close come out UNRESOLVED (IEW2456E) and the
+  # binder ends with RC 12 -- which reads as a broken library rather than a
+  # short link line. Take LIBS and LDFLAGS from the Makefile that configure
+  # generated so the KAT links exactly the way the library was built, instead of
+  # restating the zoslib paths here where they would drift.
+  _mkf="${ZOPEN_ROOT}/${sourcedir}/src/libsodium/Makefile"
+  _plibs=$(grep -E "^LIBS =" "${_mkf}" 2> /dev/null | head -1 | sed "s/^LIBS = *//")
+  _pldf=$(grep -E "^LDFLAGS =" "${_mkf}" 2> /dev/null | head -1 | sed "s/^LDFLAGS = *//")
+  # CFLAGS matters for more than optimisation here: it carries
+  # -fzos-le-char-mode=ascii. Without it the KAT's string literals are EBCDIC,
+  # so its PASS:/FAIL: lines land in the log in a character set that
+  # zopen_check_results cannot grep, and the run is scored as zero tests even
+  # though every assertion passed.
+  _pcfl=$(grep -E "^CFLAGS =" "${_mkf}" 2> /dev/null | head -1 | sed "s/^CFLAGS = *//")
   # _OPEN_THREADS is required for pthread_t to be declared at all on z/OS.
-  "${CC:-clang}" -D_OPEN_THREADS=3 \
+  "${CC:-clang}" -D_OPEN_THREADS=3 ${_pcfl} \
     -I"${ZOPEN_ROOT}/${sourcedir}/src/libsodium/include" \
     -I"${ZOPEN_ROOT}/${sourcedir}/src/libsodium/include/sodium" \
-    -o kat kat.c "${ZOPEN_ROOT}/${sourcedir}/src/libsodium/.libs/libsodium.a" || return 1
+    ${_pldf} \
+    -o kat kat.c "${ZOPEN_ROOT}/${sourcedir}/src/libsodium/.libs/libsodium.a" \
+    ${_plibs} || return 1
   ./kat
 }
 
@@ -212,4 +298,47 @@ zopen_check_results() {
 
 zopen_append_to_validate_install() {
   echo "test -f \${PWD}/lib/libsodium.a"
+}
+
+# libsodium always builds nine SIMD convenience libraries -- libaesni,
+# libarmcrypto, libsse2, libssse3, libsse41, libavx2, libavx512f and friends --
+# and links them into libsodium via libsodium_la_LIBADD. There is no configure
+# switch to suppress them; --disable-asm does not.
+#
+# On z/OS libtool cannot merge them. It extracts each convenience archive into
+# .libs/libsodium.lax/ and then emits archive commands that arrive with an
+# empty command word, so the shell tries to execute the object file itself:
+#
+#   .libs/libsodium.lax/libaesni.a/libaesni_la-aegis128l_aesni.o: ...
+#   FSUM9209 cannot execute: reason code = ef076015: EDC5111I Permission denied.
+#
+# The message names libaesni only because it is extracted first, which makes it
+# read as an AES-NI or x86 problem; it is neither, and it is not the command
+# length either (lowering libtool's max_cmd_len only changes how many objects
+# are reported).
+#
+# Every one of these archives is x86 or ARM. Their sources compile to
+# implementation tables guarded by HAVE_AESNIINTRIN_H and friends, none of which
+# are defined here, so nothing in the build references them -- verified by
+# linking sign/verify, BLAKE2b and randombytes against the resulting library
+# with the archives dropped. Removing them from LIBADD costs nothing on z/OS and
+# is what lets the link complete.
+#
+# Matched on the assignment rather than by line number: LIBADD spans
+# continuation lines, and the generated Makefile shifts between releases.
+zopen_pre_build() {
+  _mf="src/libsodium/Makefile"
+  [ -f "${_mf}" ] || return 0
+  _tag=$(ls -T "${_mf}" 2> /dev/null | awk '{print $2}')
+  awk '
+    /^libsodium_la_LIBADD =/ {
+      print "libsodium_la_LIBADD ="
+      if ($0 ~ /\\$/) { skip = 1 }
+      next
+    }
+    skip == 1 { if ($0 !~ /\\$/) { skip = 0 } ; next }
+    { print }
+  ' "${_mf}" > "${_mf}.zos" && mv "${_mf}.zos" "${_mf}"
+  [ -n "${_tag}" ] && chtag -tc "${_tag}" "${_mf}" 2> /dev/null
+  return 0
 }
